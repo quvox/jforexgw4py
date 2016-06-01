@@ -42,6 +42,7 @@ public class JForexGateway implements IStrategy {
 	private IEngine engine;
 	private IAccount account;
 	private IHistory history;
+	private IDataService dataservice;
 	private long strategyID = 0;
 
 	private boolean is_running = false;
@@ -74,6 +75,7 @@ public class JForexGateway implements IStrategy {
 		cmd_mappings.put("close", this.getClass().getMethod("closeOrder", HashMap.class));
 		cmd_mappings.put("getorders", this.getClass().getMethod("getOrders", HashMap.class));
 		cmd_mappings.put("tick", this.getClass().getMethod("getTick", HashMap.class));
+		cmd_mappings.put("isonline", this.getClass().getMethod("checkOnline", HashMap.class));
 		cmd_mappings.put("set", this.getClass().getMethod("setConfigurations", HashMap.class));
 	}
 
@@ -132,15 +134,20 @@ public class JForexGateway implements IStrategy {
 		engine = context.getEngine();
 		account = context.getAccount();
 		history = context.getHistory();
+		dataservice = context.getDataService();
 
 		//subscribe to the instruments
 		subscribeInstruments(Params.instruments);
+		
+		long currentTime = System.currentTimeMillis() / 1000L;
+		String online = isOnline(currentTime) ? "true" : "false";
 
 		Map<String, String> returnInfo = getHashMap("on_start");
 		returnInfo.put("type", "on_start");
 		returnInfo.put("user", account.getUserName());
 		returnInfo.put("account_type", String.valueOf(engine.getType()));
 		returnInfo.put("mode", String.valueOf(engine.getRunMode()));
+		returnInfo.put("online", online);
 		notifyToPython(returnInfo);
 	}
 
@@ -163,8 +170,28 @@ public class JForexGateway implements IStrategy {
 			IInstrumentStatusMessage imsg = (IInstrumentStatusMessage)message;
 			returnInfo.put("instrument", imsg.getInstrument().toString());
 			returnInfo.put("tradable", String.valueOf(imsg.isTradable()));
+		} else if (msg_type == IMessage.Type.NOTIFICATION) {
+			returnInfo.put("content", message.getContent());
+		} else if (msg_type == IMessage.Type.ORDER_CHANGED_OK || msg_type == IMessage.Type.ORDER_CHANGED_REJECTED ||
+				   msg_type == IMessage.Type.ORDER_CLOSE_OK || msg_type == IMessage.Type.ORDER_CLOSE_REJECTED ||
+				   msg_type == IMessage.Type.ORDER_FILL_OK || msg_type == IMessage.Type.ORDER_FILL_REJECTED ||
+				   msg_type == IMessage.Type.ORDER_SUBMIT_OK || msg_type == IMessage.Type.ORDER_SUBMIT_REJECTED ||
+				   msg_type == IMessage.Type.ORDERS_MERGE_OK || msg_type == IMessage.Type.ORDERS_MERGE_REJECTED ||
+				   msg_type == IMessage.Type.STOP_LOSS_LEVEL_CHANGED || msg_type == IMessage.Type.WITHDRAWAL) {
+			IOrder order = message.getOrder();
+			returnInfo.put("order_status", msg_type.toString());
+			returnInfo.put("label", order.getLabel());
+			returnInfo.put("id", order.getId());
+			returnInfo.put("instrument", order.getInstrument().toString().replaceAll("/", "_"));
+			returnInfo.put("state", order.getState().name());
+			String side = order.isLong() ? "buy" : "sell";
+			returnInfo.put("side", side);
+		} else if (msg_type == IMessage.Type.STOP_LOSS_LEVEL_CHANGED) {
+			IStopLossLevelChangedMessage isllcm = (IStopLossLevelChangedMessage)message;
+			returnInfo.put("prev_sl", String.valueOf(isllcm.previousStopLossLevel()));
+			returnInfo.put("new_sl", String.valueOf(isllcm.stopLossLevel()));
 		} else {
-			returnInfo.put("instrument", message.toString());
+			returnInfo.put("alltext", message.toString());
 		}
 		if (message.getOrder() != null) returnInfo.put("order", message.getOrder().toString());
 		notifyToPython(returnInfo);
@@ -198,6 +225,15 @@ public class JForexGateway implements IStrategy {
 		notifyToPython(returnInfo);
     }
 
+	private boolean isOnline(long time) throws JFException{
+	    Set<ITimeDomain> offlines = dataservice.getOfflineTimeDomains(time - Period.WEEKLY.getInterval(), time + Period.WEEKLY.getInterval());
+	    for(ITimeDomain offline : offlines){
+	        if( time > offline.getStart() &&  time < offline.getEnd()){
+	            return true;
+	        }
+	    }
+	    return false;
+	}
 	/**
 	 * login process
 	 */
@@ -352,6 +388,12 @@ public class JForexGateway implements IStrategy {
 			notifyFatal(e.toString());
 			System.exit(1);
 		}
+		
+		Map<String, String> returnInfo = getHashMap("pip");
+		for (Instrument inst: instrumentSet) {
+			returnInfo.put(inst.toString().replace("/", "_"), String.valueOf(inst.getPipValue()));
+		}
+		notifyToPython(returnInfo);
 	}
 
 	public void doOrder(HashMap<String,String> hm) {
@@ -467,6 +509,23 @@ public class JForexGateway implements IStrategy {
 		returnInfo.put("time", String.valueOf(tick.getTime()));
 		returnInfo.put("instrument", hm.get("instrument").replaceAll("_", "/"));
 		notifyToPython(returnInfo);
+	}
+
+	public void checkOnline(HashMap<String,String> hm) {
+		long time = Long.valueOf(hm.get("time"));
+		try {
+			Map<String, String> returnInfo = getHashMap("report");
+			returnInfo.put("cmd", hm.get("cmd"));
+			String online = isOnline(time) ? "true" : "false";
+			returnInfo.put("isonline", online);
+			notifyToPython(returnInfo);
+		} catch (JFException e) {
+			e.printStackTrace();
+			Map<String, String> returnInfo = getHashMap("report");
+			returnInfo.put("cmd", hm.get("cmd"));
+			returnInfo.put("error", e.toString());
+			notifyToPython(returnInfo);
+		}
 	}
 
 	public void setConfigurations(HashMap<String,String> hm) {

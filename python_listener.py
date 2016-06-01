@@ -89,12 +89,17 @@ class Dukascopy():
                            'volume':str(volume), 'price':str(price),
                            'tp':str(takeProfit), 'sl':str(stopLoss)})
 
+    def cancel_order(self, ticket_id, volume=0):
+        self.send_command({'cmd':'modifyorder', 'ticket_id':ticket_id, 'volume':str(volume)})
+
     def close_order(self, ticket_id, volume=0):
         self.send_command({'cmd':'closeorder', 'ticket_id':ticket_id, 'volume':str(volume)})
 
-    def close(self, ticket_id):
-        self.send_command({'cmd':'close', 'ticket_id':ticket_id})
+    def close(self, ticket_id, volume=0):
+        self.send_command({'cmd':'close', 'ticket_id':ticket_id, 'volume':str(volume)})
 
+    def is_online(self, tm):
+        self.send_command({'cmd':'isonline', 'time':tm})
 
 
 if __name__ == "__main__":
@@ -112,6 +117,7 @@ if __name__ == "__main__":
             continue
         elif line == "":
             continue
+        
         cmd = re.split('\s+', line.strip())
         if cmd[0] == 'stop':
             dc.stop()
@@ -123,9 +129,7 @@ if __name__ == "__main__":
             tick, bar, instruments = cmd[1:]
             dc.set_conf(tick=tick, bar=bar, instruments=instruments)
         elif cmd[0] == 'market_order':
-            print(len(cmd))
             for i in range(7-len(cmd)): cmd.append(-1)
-            print(cmd[1:])
             ticket_id, instrument, side, volume, tp, sl = cmd[1:]
             dc.market_order(ticket_id, instrument, side, volume, takeProfit=tp, stopLoss=sl)
         elif cmd[0] == 'limit_order':
@@ -136,7 +140,24 @@ if __name__ == "__main__":
             for i in range(7-len(cmd)): cmd.append(-1)
             ticket_id, instrument, side, volume, price, tp, sl = cmd[1:]
             dc.market_order(ticket_id, instrument, side, volume, price, takeProfit=tp, stopLoss=sl)
+        elif cmd[0] == 'mit_order':
+            for i in range(7-len(cmd)): cmd.append(-1)
+            ticket_id, instrument, side, volume, price, tp, sl = cmd[1:]
+            dc.mit_order(ticket_id, instrument, side, volume, price, takeProfit=tp, stopLoss=sl)
+        elif cmd[0] == 'modify_order':
+            for i in range(5-len(cmd)): cmd.append(-1)
+            ticket_id, volume, price, takeProfit, stopLoss = cmd[1:]
+            dc.modify_order(ticket_id, volume, price, takeProfit=tp, stopLoss=sl)
+        elif cmd[0] == 'cancel_order':
+            for i in range(3-len(cmd)): cmd.append(0)
+            dc.cancel_order(cmd[1], volume=cmd[2])
+        elif cmd[0] == 'close':
+            for i in range(3-len(cmd)): cmd.append(0)
+            dc.close(cmd[1], volume=cmd[2])
+        elif cmd[0] == 'is_online':
+            dc.is_online(cmd[1])
 
-        print("--------------------")
+            
+    print("--------------------")
 
     dc.disconnect()
