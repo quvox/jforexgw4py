@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.slf4j.LoggerFactory;
 import org.slf4j.Logger;
@@ -71,7 +72,6 @@ public class JForexGateway implements IStrategy {
 		cmd_mappings.put("stoporder", this.getClass().getMethod("doOrder", HashMap.class));
 		cmd_mappings.put("mitorder", this.getClass().getMethod("doOrder", HashMap.class));
 		cmd_mappings.put("modifyorder", this.getClass().getMethod("modifyOrder", HashMap.class));
-		cmd_mappings.put("cancelorder", this.getClass().getMethod("modifyOrder", HashMap.class));
 		cmd_mappings.put("close", this.getClass().getMethod("closeOrder", HashMap.class));
 		cmd_mappings.put("getorders", this.getClass().getMethod("getOrders", HashMap.class));
 		cmd_mappings.put("tick", this.getClass().getMethod("getTick", HashMap.class));
@@ -184,7 +184,7 @@ public class JForexGateway implements IStrategy {
 			returnInfo.put("id", order.getId());
 			returnInfo.put("instrument", order.getInstrument().toString().replaceAll("/", "_"));
 			returnInfo.put("state", order.getState().name());
-			String side = order.isLong() ? "buy" : "sell";
+			String side = order.isLong() ? "long" : "short";
 			returnInfo.put("side", side);
 		} else if (msg_type == IMessage.Type.STOP_LOSS_LEVEL_CHANGED) {
 			IStopLossLevelChangedMessage isllcm = (IStopLossLevelChangedMessage)message;
@@ -399,9 +399,10 @@ public class JForexGateway implements IStrategy {
 	public void doOrder(HashMap<String,String> hm) {
 		String cmd = hm.get("cmd");
 		String failStr = "";
-		Future<IOrder> order = null;
+		IOrder order = null;
 		try {
-			order = context.executeTask(new OrderTask(order_types.get(cmd), hm));
+			Future<IOrder> future = context.executeTask(new OrderTask(order_types.get(cmd), hm));
+			order = future.get();
 		} catch (Exception e) {
 			e.printStackTrace();
 			failStr = e.toString();
@@ -420,9 +421,10 @@ public class JForexGateway implements IStrategy {
 	public void modifyOrder(HashMap<String,String> hm) {
 		log.info("modifyOrder()");
 		String failStr = "";
-		Future<IOrder> order = null;
+		IOrder order = null;
 		try {
-			order = context.executeTask(new ModifyOrderTask(hm));
+			Future<IOrder> future = context.executeTask(new ModifyOrderTask(hm));
+			order = future.get();
 		} catch (Exception e) {
 			e.printStackTrace();
 			failStr = e.toString();
@@ -441,12 +443,16 @@ public class JForexGateway implements IStrategy {
 	public void closeOrder(HashMap<String,String> hm) {
 		log.info("closeOrder()");
 		try {
-			context.executeTask(new CloseTask(hm));
+			context.executeTask(new CloseTask(hm)).get();
 		} catch (Exception e) {
 			e.printStackTrace();
 			Map<String, String> returnInfo = getHashMap("report");
 			returnInfo.put("info", "fail:"+e.toString());
 		}
+		Map<String, String> returnInfo = getHashMap("report");
+		returnInfo.put("cmd", hm.get("cmd"));
+		returnInfo.put("done", "true");
+		notifyToPython(returnInfo);
 	}
 	
 	public void getOrders(HashMap<String,String> hm) {
@@ -473,6 +479,11 @@ public class JForexGateway implements IStrategy {
 			entry.put("req_volume", String.valueOf(o.getRequestedAmount()));
 			entry.put("tp", String.valueOf(o.getTakeProfitPrice()));
 			entry.put("sl", String.valueOf(o.getStopLossPrice()));
+			long creationtime = o.getCreationTime();
+			long goodtime = o.getGoodTillTime() - creationtime;
+			if (goodtime < 0) { goodtime = 0; }
+			entry.put("creation_time", String.valueOf(creationtime));
+			entry.put("days", String.valueOf(TimeUnit.MILLISECONDS.toDays(goodtime)));
 			result.put(o.getLabel(), entry);
 		}
 		Map<String, String> returnInfo = getHashMap("report");
@@ -559,6 +570,8 @@ public class JForexGateway implements IStrategy {
 	    private final double slippage;
 	    private final double takeProfit;
 	    private final double stopLoss;
+	    private final double pip_unit;
+	    private long goodTime_days = -1;
 
 	    public OrderTask(int type, HashMap<String,String> hm) {
 			this.ticket_id = hm.get("ticket_id");
@@ -567,16 +580,19 @@ public class JForexGateway implements IStrategy {
 				this.side = hm.get("side").equals("buy") ? OrderCommand.BUY : OrderCommand.SELL;
 			} else if (type == TYPE_LIMIT_ORDER) {
 				this.side = hm.get("side").equals("buy") ? OrderCommand.BUYLIMIT : OrderCommand.SELLLIMIT;
+				this.goodTime_days = hm.containsKey("days") ? Long.valueOf(hm.get("days")) : -1;
 			} else if (type == TYPE_STOP_ORDER) {
 				this.side = hm.get("side").equals("buy") ? OrderCommand.BUYSTOP : OrderCommand.SELLSTOP;
+				this.goodTime_days = hm.containsKey("days") ? Long.valueOf(hm.get("days")) : -1;
 			} else {
 				this.side = null;
 			}
 			this.volume = Double.valueOf(hm.get("volume"));
 			this.price = hm.containsKey("price") ? Double.valueOf(hm.get("price")) : 0;
 			this.slippage = hm.containsKey("slippage") ? Double.valueOf(hm.get("slippage")) : DEFAULT_SLIPPAGE;
-			this.takeProfit = hm.containsKey("sl") ? Double.valueOf(hm.get("sl")) : -1;
-			this.stopLoss = hm.containsKey("tp") ? Double.valueOf(hm.get("tp")) : -1;
+			this.takeProfit = hm.containsKey("sl_pips") ? Double.valueOf(hm.get("sl_pips")) : 0;
+			this.stopLoss = hm.containsKey("tp_pips") ? Double.valueOf(hm.get("tp_pips")) : 0;
+			this.pip_unit = this.instrument.getPipValue();
 	    }
 
 	    public IOrder call() throws Exception {
@@ -586,8 +602,28 @@ public class JForexGateway implements IStrategy {
 	    	} else {
 	    		order = engine.submitOrder(ticket_id, instrument, side, volume);
 	    	}
-	    	if (takeProfit >= 0) order.setTakeProfitPrice(takeProfit);
-	    	if (stopLoss >= 0) order.setStopLossPrice(stopLoss);
+	    	order.waitForUpdate(10000);
+	    	if (goodTime_days > 0) {
+	    		long currentTime = System.currentTimeMillis();
+	    		order.setGoodTillTime(currentTime + goodTime_days * 86400000);
+	    		order.waitForUpdate(10000);
+	    	}
+    		double openPrice = order.getOpenPrice();
+	    	if (takeProfit >= 0) {
+	    		if (order.isLong()) {
+	    			order.setTakeProfitPrice(openPrice + takeProfit * pip_unit);
+	    		} else {
+	    			order.setTakeProfitPrice(openPrice - takeProfit * pip_unit);
+	    		}
+	    		order.waitForUpdate(10000);
+		    }
+	    	if (stopLoss >= 0) {
+	    		if (order.isLong()) {
+	    			order.setStopLossPrice(openPrice - stopLoss * pip_unit);
+	    		} else {
+	    			order.setStopLossPrice(openPrice + stopLoss * pip_unit);
+	    		}
+	    	}
 	        return order;
 	    }
 	}
@@ -599,21 +635,50 @@ public class JForexGateway implements IStrategy {
 	    private final double price;
 	    private final double takeProfit;
 	    private final double stopLoss;
+	    private long goodTime_days = -1;
 
 	    public ModifyOrderTask(HashMap<String,String> hm) {
 			this.ticket_id = hm.get("ticket_id");
 			this.volume = hm.containsKey("volume") ? Double.valueOf(hm.get("volume")) : 0;
 			this.price = hm.containsKey("price") ? Double.valueOf(hm.get("price")) : 0;
-			this.takeProfit = hm.containsKey("sl") ? Double.valueOf(hm.get("sl")) : -1;
-			this.stopLoss = hm.containsKey("tp") ? Double.valueOf(hm.get("tp")) : -1;
-	    }
+			this.takeProfit = hm.containsKey("sl_pips") ? Double.valueOf(hm.get("sl_pips")) : 0;
+			this.stopLoss = hm.containsKey("tp_pips") ? Double.valueOf(hm.get("tp_pips")) : 0;
+			this.goodTime_days = hm.containsKey("days") ? Long.valueOf(hm.get("days")) : -1;
+		}
 
 	    public IOrder call() throws Exception {
 	    	IOrder order = engine.getOrder(ticket_id);
-	    	if (price > 0) order.setOpenPrice(price);
-	    	if (volume > 0) order.setRequestedAmount(volume);
-	    	if (takeProfit >= 0) order.setTakeProfitPrice(takeProfit);
-	    	if (stopLoss >= 0) order.setStopLossPrice(stopLoss);
+	    	if (order.getState() == IOrder.State.CREATED && price > 0) {
+	    		order.setOpenPrice(price);
+		    	order.waitForUpdate(10000);
+	    	}
+	    	if (order.getState() == IOrder.State.CREATED && volume > 0) {
+	    		order.setRequestedAmount(volume);
+	    		order.waitForUpdate(10000);
+	    	}
+	    	double openPrice = order.getOpenPrice();
+	    	double pip_unit = order.getInstrument().getPipValue();
+    		if (takeProfit >= 0) {
+    			if (order.isLong()) {
+    				order.setTakeProfitPrice(openPrice + takeProfit * pip_unit);
+    			} else {
+    				order.setTakeProfitPrice(openPrice - takeProfit * pip_unit);
+    			}
+        		order.waitForUpdate(10000);
+    		}
+    		if (stopLoss >= 0) {
+    			if (order.isLong()) {
+    				order.setStopLossPrice(openPrice - stopLoss * pip_unit);
+    			} else {
+    			order.setStopLossPrice(openPrice + stopLoss * pip_unit);
+    			}
+        		order.waitForUpdate(10000);
+    		}
+	    	if (goodTime_days > 0) {
+	    		long creationTime = order.getCreationTime();
+	    		order.setGoodTillTime(creationTime + goodTime_days * 86400000);
+	    		order.waitForUpdate(10000);
+	    	}
 	        return order;
 	    }
 	}
